@@ -86,11 +86,9 @@ fn run_echo(client_addr: SocketAddr, server_addr: SocketAddr) {
             client
                 .connect(&server_addr, "localhost")
                 .unwrap()
-                .map_err(|e| panic!("connection failed: {}", e))
+                .map_err(|e| panic!("connection failed: {}", e.unwrap()))
                 .and_then(move |conn| {
-                    tokio_current_thread::spawn(
-                        conn.driver.map_err(|e| eprintln!("connection lost: {}", e)),
-                    );
+                    tokio_current_thread::spawn(conn.driver.map_err(|e| panic!("{}", e)));
                     let conn = conn.connection;
                     let stream = conn.open_bi();
                     stream

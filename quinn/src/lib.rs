@@ -406,10 +406,10 @@ impl EndpointInner {
 struct Pending {
     blocked_writers: FnvHashMap<StreamId, Task>,
     blocked_readers: FnvHashMap<StreamId, Task>,
-    uni_opening: VecDeque<oneshot::Sender<Result<StreamId, ConnectionError>>>,
-    bi_opening: VecDeque<oneshot::Sender<Result<StreamId, ConnectionError>>>,
+    uni_opening: VecDeque<oneshot::Sender<Result<StreamId, Option<ConnectionError>>>>,
+    bi_opening: VecDeque<oneshot::Sender<Result<StreamId, Option<ConnectionError>>>>,
     incoming_streams_reader: Option<Task>,
-    finishing: FnvHashMap<StreamId, oneshot::Sender<Option<ConnectionError>>>,
+    finishing: FnvHashMap<StreamId, oneshot::Sender<Option<Option<ConnectionError>>>>,
     error: Option<ConnectionError>,
     closing: Option<oneshot::Sender<()>>,
 }
@@ -430,6 +430,10 @@ impl Pending {
 
     fn fail(&mut self, reason: ConnectionError) {
         self.error = Some(reason.clone());
+        self.terminate();
+    }
+
+    fn terminate(&mut self) {
         for (_, writer) in self.blocked_writers.drain() {
             writer.notify()
         }
@@ -437,16 +441,16 @@ impl Pending {
             reader.notify()
         }
         for x in self.uni_opening.drain(..) {
-            let _ = x.send(Err(reason.clone()));
+            let _ = x.send(Err(self.error.clone()));
         }
         for x in self.bi_opening.drain(..) {
-            let _ = x.send(Err(reason.clone()));
+            let _ = x.send(Err(self.error.clone()));
         }
         if let Some(x) = self.incoming_streams_reader.take() {
             x.notify();
         }
         for (_, x) in self.finishing.drain() {
-            let _ = x.send(Some(reason.clone()));
+            let _ = x.send(Some(self.error.clone()));
         }
     }
 }
@@ -479,12 +483,14 @@ pub struct ConnectingFuture(Option<ConnectionDriver>);
 
 impl Future for ConnectingFuture {
     type Item = NewConnection;
-    type Error = ConnectionError;
+    type Error = Option<ConnectionError>;
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let connected = match &mut self.0 {
             Some(driver) => {
                 match driver.poll()? {
-                    Async::Ready(()) => unreachable!("cannot close without completing"),
+                    Async::Ready(()) => {
+                        return Err(None);
+                    }
                     Async::NotReady => {}
                 }
                 (driver.0).borrow().connected
@@ -557,7 +563,7 @@ pub struct Connection(ConnectionRef);
 
 impl Connection {
     /// Initite a new outgoing unidirectional stream.
-    pub fn open_uni(&self) -> impl Future<Item = SendStream, Error = ConnectionError> {
+    pub fn open_uni(&self) -> impl Future<Item = SendStream, Error = Option<ConnectionError>> {
         let (send, recv) = oneshot::channel();
         {
             let mut conn = self.0.borrow_mut();
@@ -576,7 +582,7 @@ impl Connection {
     }
 
     /// Initiate a new outgoing bidirectional stream.
-    pub fn open_bi(&self) -> impl Future<Item = BiStream, Error = ConnectionError> {
+    pub fn open_bi(&self) -> impl Future<Item = BiStream, Error = Option<ConnectionError>> {
         let (send, recv) = oneshot::channel();
         {
             let mut conn = self.0.borrow_mut();
@@ -676,12 +682,7 @@ impl ConnectionInner {
         while let Some(event) = self.inner.poll_endpoint_events() {
             if let quinn::EndpointEvent::Closed { .. } = &event {
                 self.closed = true;
-                self.pending
-                    .fail(ConnectionError::TransportError(quinn::TransportError {
-                        code: quinn::TransportErrorCode::NO_ERROR,
-                        frame: None,
-                        reason: "connection is closing".to_string(),
-                    }));
+                self.pending.terminate();
             }
             self.endpoint_events
                 .unbounded_send((self.handle, EndpointEvent::Proto(event)))
@@ -846,9 +847,6 @@ impl FuturesStream for IncomingStreams {
     type Error = ConnectionError;
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         let mut conn = self.0.borrow_mut();
-        if conn.closed {
-            return Ok(Async::Ready(None));
-        }
         if let Some(x) = conn.inner.accept() {
             let stream = BiStream::new(self.0.clone(), x);
             let stream = if x.directionality() == Directionality::Uni {
@@ -858,8 +856,12 @@ impl FuturesStream for IncomingStreams {
             };
             return Ok(Async::Ready(Some(stream)));
         }
-        if let Some(ref x) = conn.pending.error {
-            Err(x.clone())
+        if conn.inner.is_closed() {
+            if let Some(ref x) = conn.pending.error {
+                Err(x.clone())
+            } else {
+                Ok(Async::Ready(None))
+            }
         } else {
             conn.pending.incoming_streams_reader = Some(task::current());
             Ok(Async::NotReady)
@@ -884,7 +886,7 @@ pub struct BiStream {
     stream: StreamId,
 
     // Send only
-    finishing: Option<oneshot::Receiver<Option<ConnectionError>>>,
+    finishing: Option<oneshot::Receiver<Option<Option<ConnectionError>>>>,
     finished: bool,
 
     // Recv only
@@ -908,11 +910,18 @@ impl Write for BiStream {
     fn poll_write(&mut self, buf: &[u8]) -> Poll<usize, WriteError> {
         use crate::quinn::WriteError::*;
         let mut conn = self.conn.borrow_mut();
+        if conn.inner.is_closed() {
+            if let Some(ref e) = conn.pending.error {
+                return Err(WriteError::ConnectionLost(e.clone()));
+            } else {
+                return Err(WriteError::ConnectionClosed);
+            }
+        }
         let n = match conn.inner.write(self.stream, buf) {
             Ok(n) => n,
             Err(Blocked) => {
                 if let Some(ref x) = conn.pending.error {
-                    return Err(WriteError::ConnectionClosed(x.clone()));
+                    return Err(WriteError::ConnectionLost(x.clone()));
                 }
                 conn.pending
                     .blocked_writers
@@ -927,9 +936,16 @@ impl Write for BiStream {
         Ok(Async::Ready(n))
     }
 
-    fn poll_finish(&mut self) -> Poll<(), ConnectionError> {
+    fn poll_finish(&mut self) -> Poll<(), Option<ConnectionError>> {
         if self.finishing.is_none() {
             let mut conn = self.conn.borrow_mut();
+            if conn.inner.is_closed() {
+                if let Some(ref e) = conn.pending.error {
+                    return Err(Some(e.clone()));
+                } else {
+                    return Err(None);
+                }
+            }
             conn.inner.finish(self.stream);
             let (send, recv) = oneshot::channel();
             self.finishing = Some(recv);
@@ -961,8 +977,12 @@ impl Read for BiStream {
         match conn.inner.read_unordered(self.stream) {
             Ok((bytes, offset)) => Ok(Async::Ready((bytes, offset))),
             Err(Blocked) => {
-                if let Some(ref x) = conn.pending.error {
-                    return Err(ReadError::ConnectionClosed(x.clone()));
+                if conn.inner.is_closed() {
+                    if let Some(ref e) = conn.pending.error {
+                        return Err(ReadError::ConnectionLost(e.clone()));
+                    } else {
+                        return Err(ReadError::ConnectionClosed);
+                    }
                 }
                 conn.pending
                     .blocked_readers
@@ -987,8 +1007,12 @@ impl Read for BiStream {
         match conn.inner.read(self.stream, buf) {
             Ok(n) => Ok(Async::Ready(n)),
             Err(Blocked) => {
-                if let Some(ref x) = conn.pending.error {
-                    return Err(ReadError::ConnectionClosed(x.clone()));
+                if conn.inner.is_closed() {
+                    if let Some(ref e) = conn.pending.error {
+                        return Err(ReadError::ConnectionLost(e.clone()));
+                    } else {
+                        return Err(ReadError::ConnectionClosed);
+                    }
                 }
                 conn.pending
                     .blocked_readers
@@ -1024,10 +1048,13 @@ impl io::Write for BiStream {
                 io::ErrorKind::ConnectionReset,
                 format!("stream stopped by peer: error {}", error_code),
             )),
-            Err(WriteError::ConnectionClosed(e)) => Err(io::Error::new(
+            Err(WriteError::ConnectionLost(e)) => Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                format!("connection closed: {}", e),
+                format!("connection lost: {}", e),
             )),
+            Err(WriteError::ConnectionClosed) => {
+                Err(io::Error::new(io::ErrorKind::Other, "connection closed"))
+            }
         }
     }
 
@@ -1038,11 +1065,12 @@ impl io::Write for BiStream {
 
 impl AsyncWrite for BiStream {
     fn shutdown(&mut self) -> Poll<(), io::Error> {
-        self.poll_finish().map_err(|e| {
-            io::Error::new(
+        self.poll_finish().map_err(|e| match e {
+            Some(e) => io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                format!("connection closed: {}", e),
-            )
+                format!("connection lost: {}", e),
+            ),
+            None => io::Error::new(io::ErrorKind::Other, "connection closed"),
         })
     }
 }
@@ -1080,10 +1108,11 @@ impl io::Read for BiStream {
                 io::ErrorKind::ConnectionAborted,
                 format!("stream reset by peer: error {}", error_code),
             )),
-            Err(ConnectionClosed(e)) => Err(io::Error::new(
+            Err(ConnectionLost(e)) => Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                format!("connection closed: {}", e),
+                format!("connection lost: {}", e),
             )),
+            Err(ConnectionClosed) => Err(io::Error::new(io::ErrorKind::Other, "connection closed")),
             Err(UnknownStream) => Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 format!("unknown stream"),
@@ -1105,7 +1134,7 @@ impl Write for SendStream {
     fn poll_write(&mut self, buf: &[u8]) -> Poll<usize, WriteError> {
         Write::poll_write(&mut self.0, buf)
     }
-    fn poll_finish(&mut self) -> Poll<(), ConnectionError> {
+    fn poll_finish(&mut self) -> Poll<(), Option<ConnectionError>> {
         self.0.poll_finish()
     }
     fn reset(&mut self, error_code: u16) {
@@ -1252,9 +1281,12 @@ pub enum ReadError {
     /// The data on this stream has been fully delivered and no more will be transmitted.
     #[error(display = "the stream has been completely received")]
     Finished,
-    /// The connection was closed.
-    #[error(display = "connection closed: {}", _0)]
-    ConnectionClosed(ConnectionError),
+    /// The connection was lost.
+    #[error(display = "connection lost: {}", _0)]
+    ConnectionLost(ConnectionError),
+    /// The connection was locally closed
+    #[error(display = "connection closed")]
+    ConnectionClosed,
     /// Unknown stream
     #[error(display = "unknown stream")]
     UnknownStream,
@@ -1272,7 +1304,7 @@ pub trait Write {
     ///
     /// No new data may be written after calling this method. Completes when the peer has
     /// acknowledged all sent data, retransmitting data as needed.
-    fn poll_finish(&mut self) -> Poll<(), ConnectionError>;
+    fn poll_finish(&mut self) -> Poll<(), Option<ConnectionError>>;
 
     /// Close the send stream immediately.
     ///
@@ -1292,9 +1324,12 @@ pub enum WriteError {
         /// The error code supplied by the peer.
         error_code: u16,
     },
-    /// The connection was closed.
-    #[error(display = "connection closed: {}", _0)]
-    ConnectionClosed(ConnectionError),
+    /// The connection was lost.
+    #[error(display = "connection lost: {}", _0)]
+    ConnectionLost(ConnectionError),
+    /// The connection was locally closed
+    #[error(display = "connection closed")]
+    ConnectionClosed,
 }
 
 fn ensure_ipv6(x: SocketAddr) -> SocketAddrV6 {

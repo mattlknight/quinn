@@ -109,7 +109,7 @@ fn run(log: Logger, options: Opt) -> Result<()> {
     runtime.block_on(
         endpoint
             .connect(&remote, &host)?
-            .map_err(|e| format_err!("failed to connect: {}", e))
+            .map_err(|e| format_err!("failed to connect: {}", e.unwrap()))
             .and_then(move |conn| {
                 eprintln!("connected at {:?}", start.elapsed());
                 tokio_current_thread::spawn(
@@ -118,7 +118,7 @@ fn run(log: Logger, options: Opt) -> Result<()> {
                 let conn = conn.connection;
                 let stream = conn.open_bi();
                 stream
-                    .map_err(|e| format_err!("failed to open stream: {}", e))
+                    .map_err(|e| format_err!("failed to open stream: {}", e.unwrap()))
                     .and_then(move |stream| {
                         if rebind {
                             let socket = std::net::UdpSocket::bind("[::]:0").unwrap();
