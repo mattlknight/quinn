@@ -1,0 +1,10 @@
+test_task:
+  matrix:
+    - container:
+        image: rust:latest
+    - allow_failures: true
+      container:
+        image: rustlang/rust:nightly
+  build_script: cargo build --all-features
+  test_script: RUST_BACKTRACE=1 cargo test --all-features
+  before_cache_script: rm -rf $CARGO_HOME/registry/index
